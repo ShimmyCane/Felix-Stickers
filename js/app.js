@@ -4,7 +4,13 @@
   'use strict';
 
   var VERSION = '0.1.0';
-  var SHEET = window.FS_SHEET;
+  // All sheets on the page: Woods, plus the sheets in js/sheets/ (loaded by index.html).
+  var SHEETS = [window.FS_SHEET].concat(window.FS_EXTRA_SHEETS || []);
+  var startKey = '';
+  try { startKey = (new URLSearchParams(window.location.search).get('sheet') || '').toLowerCase(); } catch (e) { startKey = ''; }
+  var sheetIdx = Math.max(0, SHEETS.findIndex(function (s) { return s.key === startKey; }));
+  var SHEET = SHEETS[sheetIdx];
+  var sheetMemo = {};   // per sheet key: its placed stickers and undo history, kept while you leaf through
   var KEYS = { prefs: 'fs.prefs.v1', creations: 'fs.creations.v1', notes: 'fs.notes.v1' };
   var MAX_UNDO = 50;
   var PEEL_PULL = 0.9;  // a sticker comes away after the finger pulls 90% of its own (shorter) size
@@ -12,7 +18,11 @@
   var TAP_SLOP = 8;     // px a press may wander and still count as a press
 
   var stickerById = {};
-  SHEET.stickers.concat([SHEET.main]).forEach(function (s) { stickerById[s.id] = s; });
+  function indexStickers() {
+    stickerById = {};
+    SHEET.stickers.concat([SHEET.main]).forEach(function (s) { stickerById[s.id] = s; });
+  }
+  indexStickers();
 
   function $(sel, root) { return (root || document).querySelector(sel); }
   function el(tag, cls, html) {
@@ -89,6 +99,13 @@
     if (!a || !b) return 0;
     return Math.atan2(b.y - a.y, b.x - a.x) * 180 / Math.PI;
   }
+  // Two-finger turns are damped for small angles, so a light twist does not spin the sticker.
+  // Turn 0–15°: one third (15° gives 5°). 15–45°: a smooth ramp from 5° up to 45°. Past 45°: one to one.
+  function fuzzTurn(d) {
+    var a = Math.abs(d);
+    var out = a < 15 ? a / 3 : (a < 45 ? 5 + (a - 15) * (40 / 30) : a);
+    return d < 0 ? -out : out;
+  }
   function setLast(label) { lastItem = label; }
 
   /* ---------- rendering ---------- */
@@ -127,10 +144,12 @@
     var card = $('#sheetCard');
     card.innerHTML = '';
     var page = el('div', 'sheetPage');
-    var base = window.FS_NATIVE_BASE;
+    var base = nat().base;
     if (base) page.appendChild(el('img', 'base', null)).src = base;
     var W = SHEET.ref.w, H = SHEET.ref.h;
-    SHEET.stickers.concat([SHEET.main]).forEach(function (s) {
+    // Sheets may draw the main body first (mainFirst), so features sit on top of it.
+    var order = SHEET.mainFirst ? [SHEET.main].concat(SHEET.stickers) : SHEET.stickers.concat([SHEET.main]);
+    order.forEach(function (s) {
       var gone = state.used.indexOf(s.id) !== -1;
       var n = el('div', 'slot' + (s.id === SHEET.main.id ? ' main' : '') + (gone ? ' empty' : '') +
         (gone && lift && lift.sid === s.id ? ' lifted' : ''));
@@ -147,9 +166,14 @@
     card.appendChild(page);
   }
 
-  // Native art when provided (private/native.js, local only); otherwise the SVG in sheet.js.
+  // Art for the current sheet: its own `native` block when it has one (test sheets in private/),
+  // otherwise the Woods art in js/native.js.
+  function nat() {
+    return SHEET.native || { base: window.FS_NATIVE_BASE, art: window.FS_NATIVE_ART, placed: window.FS_NATIVE_PLACED };
+  }
+  // Native art when provided; otherwise the SVG in sheet.js.
   function artFor(s, placed) {
-    var map = placed ? window.FS_NATIVE_PLACED : window.FS_NATIVE_ART;
+    var map = placed ? nat().placed : nat().art;
     var src = map && map[s.id];
     return src ? '<img class="art" src="' + src + '" alt="" draggable="false">' : s.svg;
   }
@@ -437,8 +461,9 @@
     if (L.canvas) { L.canvas.remove(); }
   }
   function liftClear() {
-    if (lift) liftHide(lift);
+    if (lift) { clearTimeout(lift.clickTimer); liftHide(lift); }
     lift = null;
+    setDial(false);
   }
   function liftLen(L) {
     // how far the picture reaches along the drag from the pivot
@@ -450,9 +475,25 @@
     return m;
   }
 
+  // The centroid of the picked-up sticker, as fractions of its box, from the alpha of its cut-out.
+  function massCentre(img) {
+    try {
+      var s = 64 / Math.max(img.naturalWidth, img.naturalHeight);
+      var w = Math.max(1, Math.round(img.naturalWidth * s)), h = Math.max(1, Math.round(img.naturalHeight * s));
+      var c = document.createElement('canvas'); c.width = w; c.height = h;
+      var cx = c.getContext('2d'); cx.drawImage(img, 0, 0, w, h);
+      var d = cx.getImageData(0, 0, w, h).data, sx = 0, sy = 0, n = 0;
+      for (var y = 0; y < h; y++) for (var x = 0; x < w; x++) {
+        if (d[(y * w + x) * 4 + 3] > 127) { sx += x + 0.5; sy += y + 0.5; n++; }
+      }
+      if (n) return { x: sx / n / w, y: sy / n / h };
+    } catch (e) { /* blocked pixel read: use the middle of the box */ }
+    return { x: 0.5, y: 0.5 };
+  }
+
   function startLift(gesture, f) {
     // called once the finger has moved a little from the tray: the edge is the sticker's back edge
-    var img = cutoutImage(window.FS_NATIVE_PLACED && window.FS_NATIVE_PLACED[gesture.sid]);
+    var img = cutoutImage(nat().placed && nat().placed[gesture.sid]);
     if (!img) return null;
     var page = $('.sheetPage');
     var tile = gesture.tile;
@@ -474,6 +515,8 @@
       PW: page.clientWidth, PH: page.clientHeight, dpr: Math.min(window.devicePixelRatio || 1, 1.5)
     };
     L.len = liftLen(L);
+    var cm = massCentre(img);
+    L.cx = cm.x * L.W; L.cy = cm.y * L.H;   // in picture pixels: the sticker turns about this point
     L.edge = edgePoints(img);
     if (state.used.indexOf(gesture.sid) === -1) state.used.push(gesture.sid);
     renderTray();
@@ -490,24 +533,87 @@
     liftDraw(L);
   }
 
-  var FREE_MOVE_MS = 3000;   // after it is let go, the curl can be slid about for this long
+  var CLICK_MS = 500;   // after the circle is let go, the sticker clicks into place this long later
+
+  // The circle in the middle of the play area: the sticker turns as a finger goes round it.
+  function dialCentre() {
+    var r = $('#stage').getBoundingClientRect();
+    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+  }
+  function setDial(show, rot) {
+    var d = $('#dial');
+    if (!d) return;
+    d.hidden = !show;
+    if (show) $('#dialHand').style.transform = 'rotate(' + (rot * 180 / Math.PI) + 'deg)';
+  }
+  function wrapAngle(a) {
+    while (a > Math.PI) a -= 2 * Math.PI;
+    while (a <= -Math.PI) a += 2 * Math.PI;
+    return a;
+  }
 
   function liftPress(e) {
     var pt = { x: e.clientX, y: e.clientY };
     var f = pageOf(pt);
-    if (lift.phase === 'held' && Date.now() - (lift.heldAt || 0) < FREE_MOVE_MS) {
-      // free move: the curl comes along with the finger, keeping its roll
-      var tipC = { x: lift.Pv.x + lift.S * lift.u.x, y: lift.Pv.y + lift.S * lift.u.y };
-      gesture = { kind: 'carry', pid: e.pointerId, o: { x: f.x - tipC.x, y: f.y - tipC.y } };
-      lift.phase = 'carry';
-      lift.ghost = true;
-      liftDraw(lift);
-      pointers.set(e.pointerId, pt);
-      return;
-    }
-    // after the free move: it is put down from its pivot, at the roll
+    if (!lift.moved) return startCarry(e, f, pt);     // it must be moved before anything else
+    if (!lift.locked) return startDial(e, pt);        // the circle turns it
+    return startApply(e, f, pt);                      // clicked: put it down, rolling it on
+  }
+
+  function startCarry(e, f, pt) {
+    var tipC = { x: lift.Pv.x + lift.S * lift.u.x, y: lift.Pv.y + lift.S * lift.u.y };
+    gesture = { kind: 'carry', pid: e.pointerId, o: { x: f.x - tipC.x, y: f.y - tipC.y }, start: f };
+    lift.phase = 'carry';
+    lift.ghost = true;
+    liftDraw(lift);
+    pointers.set(e.pointerId, pt);
+  }
+
+  function moveCarry(f) {
+    var tip = { x: f.x - gesture.o.x, y: f.y - gesture.o.y };
+    lift.Pv = { x: tip.x - lift.S * lift.u.x, y: tip.y - lift.S * lift.u.y };
+    lift.Pm = { x: lift.Pv.x, y: lift.Pv.y };
+    if (!lift.moved && dist(gesture.start, f) > TAP_SLOP) lift.moved = true;
+    liftDraw(lift);
+  }
+
+  function startDial(e, pt) {
+    clearTimeout(lift.clickTimer);
+    var c = dialCentre();
+    gesture = { kind: 'dial', pid: e.pointerId, c: c, a0: Math.atan2(pt.y - c.y, pt.x - c.x), base: lift.dialRot || 0 };
+    lift.phase = 'dial';
+    lift.ghost = true;
+    setDial(true, lift.dialRot || 0);
+    pointers.set(e.pointerId, pt);
+  }
+
+  function moveDial(pt) {
+    var c = gesture.c;
+    var turn = wrapAngle(Math.atan2(pt.y - c.y, pt.x - c.x) - gesture.a0) * 180 / Math.PI;
+    var before = mapPic(lift, lift.cx, lift.cy);
+    lift.dialRot = gesture.base + fuzzTurn(turn) * Math.PI / 180;
+    lift.phi = lift.dialRot;
+    var after = mapPic(lift, lift.cx, lift.cy);
+    var dx = before.x - after.x, dy = before.y - after.y;   // move the pivot so the centroid stays put
+    lift.Pv = { x: lift.Pv.x + dx, y: lift.Pv.y + dy };
+    lift.Pm = { x: (lift.Pm || lift.Pv).x + dx, y: (lift.Pm || lift.Pv).y + dy };
+    liftDraw(lift);
+    setDial(true, lift.dialRot);
+  }
+
+  function endDial() {
+    lift.phase = 'held';
+    lift.ghost = true;
+    liftDraw(lift);
+    lift.clickTimer = setTimeout(function () {
+      if (!lift || lift.phase !== 'held') return;
+      lift.locked = true;     // click: the angle is set and the circle goes
+      setDial(false);
+    }, CLICK_MS);
+  }
+
+  function startApply(e, f, pt) {
     var tipA = { x: lift.Pv.x + lift.S * lift.u.x, y: lift.Pv.y + lift.S * lift.u.y };
-    // the rolldown turns the sticker about the point it starts from: the roll itself
     var c0 = Math.cos(lift.phi), s0 = Math.sin(lift.phi);
     var dx0 = tipA.x - lift.Pm.x, dy0 = tipA.y - lift.Pm.y;
     lift.Ta = { x: lift.Ta.x + c0 * dx0 + s0 * dy0, y: lift.Ta.y - s0 * dx0 + c0 * dy0 };
@@ -520,13 +626,6 @@
     pointers.set(e.pointerId, pt);
   }
 
-  function moveCarry(f) {
-    var tip = { x: f.x - gesture.o.x, y: f.y - gesture.o.y };
-    lift.Pv = { x: tip.x - lift.S * lift.u.x, y: tip.y - lift.S * lift.u.y };
-    lift.Pm = { x: lift.Pv.x, y: lift.Pv.y };
-    liftDraw(lift);
-  }
-
   function moveApply(f) {
     var tip = { x: f.x - gesture.o.x, y: f.y - gesture.o.y };
     var E = gesture.E;
@@ -537,7 +636,7 @@
       // past the edge: the rest of the sticker unrolls onto the sheet, then it stays
       lift.Pv = E;
       lift.u = lift.lastU || lift.uL;
-      lift.phi = lift.lastPhi || 0;
+      lift.phi = lift.dialRot || 0;
       lift.S = clamp(lift.lastS || 0, 0, lift.len || 0);
       gesture = null;
       return unrollToStick(lift);
@@ -545,10 +644,11 @@
     var uNew = r > 3 ? { x: d.x / r, y: d.y / r } : lift.uL;
     lift.Pv = E;
     lift.u = uNew;
-    lift.phi = Math.atan2(uNew.y, uNew.x) - Math.atan2(lift.uL.y, lift.uL.x);
     lift.len = liftLen(lift);
     lift.S = clamp(r, 0, lift.len);
-    lift.lastU = uNew; lift.lastPhi = lift.phi; lift.lastS = lift.S;
+    // the roll only rolls: it never turns the sticker. The angle is the one the circle set.
+    lift.phi = lift.dialRot || 0;
+    lift.lastU = uNew; lift.lastS = lift.S;
     liftDraw(lift);
   }
 
@@ -567,7 +667,7 @@
 
   function stickLift() {
     var L = lift;
-    var c = mapPic(L, L.W / 2, L.H / 2);
+    var c = mapPic(L, L.cx, L.cy);
     var sheet = $('.sheetPage').getBoundingClientRect();
     var p = toPercent({ x: sheet.left + c.x, y: sheet.top + c.y });
     var item = { uid: nextUid++, stickerId: L.sid, x: p.x, y: p.y, rot: L.phi * 180 / Math.PI, committed: true };
@@ -608,6 +708,7 @@
       updatePeel(lift, f);
       return;
     }
+    if (gesture.kind === 'dial' && gesture.pid === e.pointerId) { moveDial(pt); return; }
     if (gesture.kind === 'carry' && gesture.pid === e.pointerId) { moveCarry(pageOf(pt)); return; }
     if (gesture.kind === 'apply' && gesture.pid === e.pointerId) { moveApply(pageOf(pt)); return; }
 
@@ -623,7 +724,7 @@
       if (n) placeStyle(n, item);
     } else if (gesture.kind === 'rotate') {
       var it = findItem(gesture.uid);
-      it.rot = gesture.rot0 + (angleOf(gesture.pids) - gesture.angle0);
+      it.rot = gesture.rot0 + fuzzTurn(angleOf(gesture.pids) - gesture.angle0);
       var node = elFor(it.uid);
       if (node) placeStyle(node, it);
     }
@@ -653,9 +754,15 @@
       gesture = null;
       return;
     }
+    if (gesture.kind === 'dial' && gesture.pid === e.pointerId) {
+      // let go of the circle: half a second later the sticker clicks into place
+      gesture = null;
+      if (lift) endDial();
+      return;
+    }
     if (gesture.kind === 'carry' && gesture.pid === e.pointerId) {
-      // let go: it stays where it was put; the free-move window starts again
-      if (lift) { lift.phase = 'held'; lift.heldAt = Date.now(); lift.ghost = true; liftDraw(lift); }
+      // let go: it stays where it was put; once it has been moved, the circle comes up
+      if (lift) { lift.phase = 'held'; lift.ghost = true; liftDraw(lift); if (lift.moved) setDial(true, lift.dialRot || 0); }
       gesture = null;
       return;
     }
@@ -721,6 +828,14 @@
     if (store(KEYS.creations, list)) toast('Saved to My Creations');
     else toast('Could not save on this device');
     renderCreations();
+    pushFamily('Creation', function () { return FSFamily.saveCreation(c); });
+  }
+
+  // When signed in to the family, a copy also goes to the family database. The device copy is always kept first.
+  function pushFamily(what, send) {
+    if (!(window.FSFamily && FSFamily.signedIn())) return;
+    send().then(function () { toast('Also saved to the family'); },
+      function (e) { reportError(what + ' not sent to the family: ' + e.message); });
   }
 
   function openCreation(id) {
@@ -791,12 +906,49 @@
     var text = box.value.trim();
     if (!text) { toast('Write a short note first'); return; }
     var notes = load(KEYS.notes, []);
-    notes.unshift({
-      id: 'n' + Date.now(), text: text, item: lastItem, label: SHEET.name,
+    var note = {
+      id: 'n' + Date.now(), text: text, item: lastItem, label: SHEET.name, sheetId: SHEET.id,
       version: VERSION, noted_at: new Date().toISOString()
-    });
+    };
+    notes.unshift(note);
     if (store(KEYS.notes, notes)) { box.value = ''; toast('Note saved on this device'); }
     renderNotes();
+    pushFamily('Note', function () { return FSFamily.saveNote(note); });
+  }
+
+  // Family sign-in panel: sign in or out, and say what the page is connected to.
+  function updateFamilyStatus() {
+    var st = $('#famStatus');
+    if (!st) return;
+    if (!window.FSFamily) { st.textContent = 'not set up in this copy'; return; }
+    var signed = FSFamily.signedIn();
+    $('#famSignedOut').hidden = signed;
+    $('#btnFamOut').hidden = !signed;
+    st.textContent = 'checking';
+    FSFamily.check().then(function (r) {
+      st.textContent = r.text;
+      if (r.state === 'error') reportError('Family database: ' + r.text);
+    });
+  }
+  function wireFamily() {
+    if (!window.FSFamily) return;
+    $('#btnFamIn').addEventListener('click', function () {
+      var email = $('#famEmail').value.trim(), pass = $('#famPass').value;
+      if (!email || !pass) { toast('Type the family email and password'); return; }
+      FSFamily.signIn(email, pass).then(function () {
+        $('#famPass').value = '';
+        toast('Signed in to the family');
+        updateFamilyStatus();
+      }, function (e) {
+        reportError('Sign-in: ' + e.message);
+        toast('Could not sign in');
+      });
+    });
+    $('#btnFamOut').addEventListener('click', function () {
+      FSFamily.signOut();
+      toast('Signed out. Saving on this device only.');
+      updateFamilyStatus();
+    });
   }
 
   /* ---------- errors (opt-in, shown at the bottom) ---------- */
@@ -888,7 +1040,8 @@
     $('#btnMy').addEventListener('click', function () { renderCreations(); openSheet('#mine'); });
     $('#btnMineClose').addEventListener('click', function () { closeSheet('#mine'); });
     $('#gear').addEventListener('click', function () { openSheet('#drawer'); });
-    $('#btnSettingsTop').addEventListener('click', function () { openSheet('#drawer'); });
+    $('#btnPrev').addEventListener('click', function () { goSheet((sheetIdx - 1 + SHEETS.length) % SHEETS.length); });
+    $('#btnNext').addEventListener('click', function () { goSheet((sheetIdx + 1) % SHEETS.length); });
     $('#btnClose').addEventListener('click', function () { closeSheet('#drawer'); });
 
     $('#tgUndo').addEventListener('change', function (e) {
@@ -914,6 +1067,8 @@
     });
 
     $('#btnNote').addEventListener('click', addNote);
+    wireFamily();
+    wireSheetLoad();
     $('#errorBar').addEventListener('click', function () { prefs.showErrors = false; store(KEYS.prefs, prefs); $('#tgErrors').checked = false; renderErrors(); });
 
     window.addEventListener('error', function (e) { reportError(e.message || 'Script error'); });
@@ -927,11 +1082,77 @@
     st.style.setProperty('--pageW', Math.round(w) + 'px');
   }
 
+  // Leaf through the sheets. Each sheet keeps its own stickers and undo history.
+  // A sheet loaded from the device (settings > Sheets). Its files are read in this browser only.
+  function addSheet(sheet) {
+    for (var i = 0; i < SHEETS.length; i++) if (SHEETS[i].key === sheet.key) return false;
+    SHEETS.push(sheet);
+    updatePager();
+    return true;
+  }
+  function loadSheetFiles(files) {
+    var js = files.filter(function (f) { return /sheet\.js$/i.test(f.name); })[0];
+    var pngs = files.filter(function (f) { return /\.png$/i.test(f.name); });
+    if (!js || !pngs.length) { toast('Pick the sheet.js file and its .png files'); return; }
+    var urls = {};
+    pngs.forEach(function (f) { urls[f.name] = URL.createObjectURL(f); });
+    js.text().then(function (text) {
+      // the sheet's own paths (private/<sheet>/...png) point at the picked files instead
+      var fixed = text.replace(/private\/[^'"\s]*\/([^'"\/\s]+\.png)/g, function (m, name) { return urls[name] || m; });
+      var before = (window.FS_EXTRA_SHEETS || []).length;
+      var url = URL.createObjectURL(new Blob([fixed], { type: 'text/javascript' }));
+      var s = document.createElement('script');
+      s.onload = function () {
+        var list = window.FS_EXTRA_SHEETS || [];
+        if (list.length > before && addSheet(list[list.length - 1])) toast('Sheet loaded: ' + list[list.length - 1].name);
+        else toast('That sheet is already loaded, or did not load');
+        URL.revokeObjectURL(url);
+      };
+      s.onerror = function () { toast('That sheet did not load'); URL.revokeObjectURL(url); };
+      s.src = url;
+      document.head.appendChild(s);
+    }, function () { toast('Could not read that file'); });
+  }
+  function wireSheetLoad() {
+    var input = $('#sheetFile');
+    if (!input) return;
+    input.addEventListener('change', function () {
+      var files = Array.prototype.slice.call(input.files || []);
+      input.value = '';
+      loadSheetFiles(files);
+    });
+  }
+
+  function updatePager() {
+    var pager = $('#pager');
+    pager.hidden = SHEETS.length < 2;
+    $('#pagerPos').textContent = (sheetIdx + 1) + ' / ' + SHEETS.length;
+  }
+  function goSheet(i) {
+    if (i === sheetIdx || i < 0 || i >= SHEETS.length) return;
+    if (gesture || lift) { toast('Put the sticker down first'); return; }
+    sheetMemo[SHEET.key] = { state: state, undo: undoStack };
+    sheetIdx = i;
+    SHEET = SHEETS[i];
+    var memo = sheetMemo[SHEET.key];
+    state = memo ? memo.state : { placed: [], used: [] };
+    undoStack = memo ? memo.undo : [];
+    indexStickers();
+    $('#title').textContent = 'Felix Stickers – ' + SHEET.name;
+    document.title = 'Felix Stickers – ' + SHEET.name;
+    sizePage();
+    render();
+    updateUndo();
+    updatePager();
+  }
+
   function start() {
     sizePage();
     window.addEventListener('resize', sizePage);
     $('#title').textContent = 'Felix Stickers – ' + SHEET.name;
     document.title = 'Felix Stickers – ' + SHEET.name;
+    updatePager();
+    updateFamilyStatus();
     $('#ver').textContent = VERSION;
     $('#storeState').textContent = storeOK ? 'working' : 'blocked (play still works)';
     setupPanels();
